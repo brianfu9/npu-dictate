@@ -14,8 +14,9 @@ output looks wrong.
 - Android SDK 35 with build-tools 35.0.0 and platform android-35.
 - JDK 17.
 - NDK r27d (only for building the native driver).
-- Python with the `tokenizers` package (the build tokenizes the context word list; set
-  `PYTHON` in `app/build.sh` if your interpreter is not on the path as `python3`).
+- Python with the `tokenizers` package (the build tokenizes the context word list). The build
+  uses `.venv/bin/python` when it exists (`python3 -m venv .venv && .venv/bin/pip install
+  tokenizers`), else `python3`; the `PYTHON` environment variable overrides both.
 
 ## Repository layout
 
@@ -83,6 +84,28 @@ comment in `app/src/com/bfu/qwenasr/MainActivity.java`):
     am start -n com.bfu.qwenasr/.MainActivity --es wav <file>
 
 Results go to the screen and to logcat (tag QwenASR).
+
+## Keeping recordings (training data)
+
+Off by default. Turn it on with the "Keep recordings" checkbox in the app's settings, or:
+
+    adb shell am start -n com.bfu.qwenasr/.MainActivity --ez keep_recordings true
+
+Every voice-keyboard session then saves two files to the app's external files directory
+(`/sdcard/Android/data/com.bfu.qwenasr/files/sessions`), which adb can read but other apps
+cannot:
+
+- `<id>.wav` — the whole session audio, 16 kHz mono (about 1.9 MB per minute). It contains
+  everything said while the keyboard listens, including pauses and other people's voices.
+- `<id>.json` — the recognized segments with their times, every polish request and response
+  (including the model's raw output), and the committed text.
+
+The phone keeps at most 2 GB of sessions and deletes the oldest ones beyond that. To move
+them to a computer:
+
+    scripts/pull-sessions.sh <dest dir> --delete
+
+Without `--delete` it only copies; re-running never pulls a session twice.
 
 ## Known limits
 

@@ -53,6 +53,8 @@ public class VoiceIme extends InputMethodService {
     private String partial = "";
     private String lead = "";              // a leading space when the field already has text before the cursor
     private boolean polishBusy, polishAgain, waitingToCommit, wantStart;
+    private SessionLog log;                // session record for training data (null when off)
+    private String lastRendered = "";      // what render() last gave to setComposingText
 
     @Override
     public View onCreateInputView() {
@@ -113,12 +115,12 @@ public class VoiceIme extends InputMethodService {
 
     private void toggleMic() {
         if (recording) { stopRecording(); return; }
-        if (hasComposing()) commitNow();   // the old text goes into the field before a new session starts
+        if (hasComposing()) commitNow("new_session");   // the old text goes into the field before a new session starts
         startDictation();
     }
 
     private void switchKeyboard() {
-        if (dictationActive()) commitNow();
+        if (dictationActive()) commitNow("switch");
         // switchToPreviousInputMethod() only hid the keyboard on the OPPO phone (2026-11-20), so switch by
         // id: Gboard if enabled, else the first other enabled IME with a typing ("keyboard") subtype
         // (skips voice-only IMEs such as Google's voice input); fall back to the picker.
@@ -152,7 +154,7 @@ public class VoiceIme extends InputMethodService {
     }
 
     private void sendEnter() {
-        commitNow();
+        commitNow("send");
         sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER);
     }
 
@@ -203,11 +205,19 @@ public class VoiceIme extends InputMethodService {
         final Streamer streamer;
         try {
             streamer = new Streamer(Asr.engine(), Asr.vadModel(this), getCacheDir(), true, listenerFor(sid))
-                    .setFullPass(false, 30f);   // qwen27b polishes instead; the session audio is not saved
+                    .setFullPass(false, 30f);   // qwen27b polishes instead of the full pass
         } catch (Exception e) {
             setStatus("Cannot start: " + e.getMessage());
             rec.release();
             return;
+        }
+        if (Asr.keepRecordings(this)) {
+            EditorInfo ei = getCurrentInputEditorInfo();
+            String fieldPkg = ei == null || ei.packageName == null ? "" : ei.packageName;
+            log = new SessionLog(Asr.sessionsDir(this), fieldPkg, Asr.polishModel(), this);
+            streamer.saveSessionTo(log.wavFile(), 0);   // the Streamer keeps no older files; SessionLog.prune() does
+        } else {
+            log = null;
         }
         st = streamer;
         raw.clear(); polished.clear(); partial = "";
@@ -263,6 +273,7 @@ public class VoiceIme extends InputMethodService {
             body.append(partial);
         }
         String text = body.length() == 0 ? "" : lead + body;
+        lastRendered = text;
         InputConnection ic = getCurrentInputConnection();
         if (ic != null) ic.setComposingText(text, 1);
     }
@@ -275,15 +286,21 @@ public class VoiceIme extends InputMethodService {
         polishBusy = true;
         final int sid = sessionId;
         final List<String> snapshot = new ArrayList<>(raw);
+        final SessionLog sl = log;   // the record belongs to the session that sent this request
+        final long started = SystemClock.elapsedRealtime();
         net.execute(() -> {
             Polisher.Result r = null;
+            String err = null;
             try {
                 r = Asr.polisher().polish(snapshot);
             } catch (IOException e) {
                 Log.w("QwenASR", "polish failed: " + e.getMessage());
+                err = e.getMessage();
             }
             final Polisher.Result res = r;
+            final String error = err;
             ui.post(() -> {
+                if (sl != null) sl.polish(snapshot, res, error, started, SystemClock.elapsedRealtime() - started);
                 if (sid == sessionId) {
                     if (res != null) {
                         if (raw.size() >= snapshot.size() && raw.subList(0, snapshot.size()).equals(snapshot)) {
@@ -299,7 +316,7 @@ public class VoiceIme extends InputMethodService {
                 }
                 polishBusy = false;
                 if (polishAgain) { polishAgain = false; schedulePolish(); }
-                else if (waitingToCommit) commitNow();
+                else if (waitingToCommit) commitNow("stop");
             });
         });
     }
@@ -310,7 +327,7 @@ public class VoiceIme extends InputMethodService {
     }
 
     /** Commits whatever text exists into the field. Idempotent per session. */
-    private void commitNow() {
+    private void commitNow(String reason) {
         if (committedSid == sessionId) return;
         committedSid = sessionId;
         if (recording) { recording = false; if (st != null) st.cancel(); }
@@ -319,6 +336,15 @@ public class VoiceIme extends InputMethodService {
         render();   // partial kept
         InputConnection ic = getCurrentInputConnection();
         if (ic != null) ic.finishComposingText();
+        if (log != null) {
+            log.commit(lastRendered, reason);
+            final SessionLog sl = log;
+            log = null;
+            net.execute(() -> {
+                sl.save();
+                SessionLog.prune(Asr.sessionsDir(VoiceIme.this), 2L << 30);   // keep at most 2 GB
+            });
+        }
         raw.clear(); polished.clear(); partial = "";
         waitingToCommit = false;
         wantStart = false;
@@ -333,7 +359,11 @@ public class VoiceIme extends InputMethodService {
             @Override public void onFinal(String text, String info) {
                 ui.post(() -> {
                     if (sid != sessionId) return;
-                    if (!text.isEmpty()) { raw.add(text); polished.add(null); }
+                    if (!text.isEmpty()) {
+                        raw.add(text);
+                        polished.add(null);
+                        if (log != null) log.segment(raw.size() - 1, text);
+                    }
                     partial = "";
                     render();
                     schedulePolish();
@@ -360,9 +390,9 @@ public class VoiceIme extends InputMethodService {
                     if (polishBusy || (hasUnpolished() && Asr.polisher() != null)) {
                         waitingToCommit = true;
                         setStatus("Polishing...");
-                        ui.postDelayed(() -> { if (sid == sessionId) commitNow(); }, 8000);
+                        ui.postDelayed(() -> { if (sid == sessionId) commitNow("stop"); }, 8000);
                     } else {
-                        commitNow();
+                        commitNow("stop");
                     }
                 });
             }
@@ -396,19 +426,19 @@ public class VoiceIme extends InputMethodService {
     /** Called while the old field is still connected: its dictation goes into it, not the next field. */
     @Override
     public void onFinishInput() {
-        if (dictationActive()) commitNow();
+        if (dictationActive()) commitNow("field_change");
         super.onFinishInput();
     }
 
     @Override
     public void onFinishInputView(boolean finishingInput) {
         super.onFinishInputView(finishingInput);
-        if (dictationActive()) commitNow();
+        if (dictationActive()) commitNow("hidden");
     }
 
     @Override
     public void onWindowHidden() {
         super.onWindowHidden();
-        if (dictationActive()) commitNow();
+        if (dictationActive()) commitNow("hidden");
     }
 }

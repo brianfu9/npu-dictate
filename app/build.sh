@@ -32,7 +32,11 @@ fi
 mkdir -p $OUT/assets
 cp assets/* $OUT/assets/
 cp "$PERSONAL/terms.txt" "$PERSONAL/polish.conf" $OUT/assets/
-${PYTHON:-python3} ../tools/make_context_ids.py "$PREBUILT/tokenizer" "$PERSONAL/context.txt" $OUT/assets/context_ids.i32
+# PYTHON: an interpreter with `tokenizers`; defaults to the repo's .venv when it exists
+if [ -z "${PYTHON:-}" ]; then
+  if [ -x ../.venv/bin/python ]; then PYTHON=../.venv/bin/python; else PYTHON=python3; fi
+fi
+$PYTHON ../tools/make_context_ids.py "$PREBUILT/tokenizer" "$PERSONAL/context.txt" $OUT/assets/context_ids.i32
 
 $BT/aapt2 compile --dir res -o $OUT/res.zip
 $BT/aapt2 link -o $OUT/base.apk --manifest AndroidManifest.xml -I $JAR -A $OUT/assets $OUT/res.zip

@@ -192,15 +192,19 @@ final class Streamer {
             running = false;
             notifyAll();
         }
-        if (saveTo != null && !cancelled) {
+        // finish() can run twice (cancel() and the mic thread); write the WAV only once.
+        if (saveTo != null && n > 0 && !wavSaved) {
+            wavSaved = true;
             try {
                 saveTo.getParentFile().mkdirs();
                 writeWavTo(0, n, saveTo);
                 Log.i("QwenASR", "saved session " + saveTo.getName() + String.format(Locale.US, " %.1f s", n / (float) RATE));
-                File[] old = saveTo.getParentFile().listFiles((d, f) -> f.endsWith(".wav"));
-                if (old != null && old.length > KEEP_SESSIONS) {
-                    java.util.Arrays.sort(old, (a, b) -> a.getName().compareTo(b.getName()));
-                    for (int i = 0; i < old.length - KEEP_SESSIONS; i++) old[i].delete();
+                if (keepSessions > 0) {
+                    File[] old = saveTo.getParentFile().listFiles((d, f) -> f.endsWith(".wav"));
+                    if (old != null && old.length > keepSessions) {
+                        java.util.Arrays.sort(old, (a, b) -> a.getName().compareTo(b.getName()));
+                        for (int i = 0; i < old.length - keepSessions; i++) old[i].delete();
+                    }
                 }
             } catch (IOException e) {
                 Log.e("QwenASR", "saving the session failed", e);
@@ -210,10 +214,18 @@ final class Streamer {
 
     static final int KEEP_SESSIONS = 50;
     private File saveTo;
+    private int keepSessions = KEEP_SESSIONS;   // <= 0: never delete older files
+    private boolean wavSaved;
 
     /** Save the whole session audio to this file when it finishes (microphone sessions); null = no. */
     Streamer saveSessionTo(File f) {
+        return saveSessionTo(f, KEEP_SESSIONS);
+    }
+
+    /** Same, but prunes older .wav files in the same directory down to `keep`; keep <= 0 never deletes. */
+    Streamer saveSessionTo(File f, int keep) {
         saveTo = f;
+        keepSessions = keep;
         return this;
     }
 

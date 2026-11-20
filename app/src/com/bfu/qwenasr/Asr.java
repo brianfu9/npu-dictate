@@ -53,6 +53,24 @@ public final class Asr {
     /** Milliseconds the last model load took. */
     public static long loadMs() { return loadMs; }
 
+    /** Whether voice-keyboard sessions are saved for training data (off by default). */
+    public static boolean keepRecordings(Context c) {
+        return c.getApplicationContext().getSharedPreferences("settings", Context.MODE_PRIVATE)
+                .getBoolean("keep_recordings", false);
+    }
+
+    public static void setKeepRecordings(Context c, boolean on) {
+        c.getApplicationContext().getSharedPreferences("settings", Context.MODE_PRIVATE)
+                .edit().putBoolean("keep_recordings", on).apply();
+    }
+
+    /** Where the session recordings (WAV + JSON) are kept; created if needed. */
+    public static File sessionsDir(Context c) {
+        File d = c.getApplicationContext().getExternalFilesDir("sessions");
+        if (!d.isDirectory()) d.mkdirs();
+        return d;
+    }
+
     /** The shared single-thread worker for model loading and other background work. */
     public static ExecutorService worker() { return worker; }
 

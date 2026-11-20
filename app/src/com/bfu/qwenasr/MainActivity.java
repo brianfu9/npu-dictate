@@ -57,6 +57,7 @@ public class MainActivity extends Activity implements Streamer.Listener {
     private static boolean settingsOpen = false;
     private Button recordBtn;
     private ScrollView scroll;
+    private CheckBox keepCheck;
 
     private volatile boolean recording;
     private Streamer streamer;
@@ -66,6 +67,7 @@ public class MainActivity extends Activity implements Streamer.Listener {
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
+        applyKeepRecordings(getIntent());
         buildUi();
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED
                 || checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
@@ -90,7 +92,17 @@ public class MainActivity extends Activity implements Streamer.Listener {
     @Override
     protected void onNewIntent(Intent i) {
         super.onNewIntent(i);
+        applyKeepRecordings(i);
         handleTestIntent(i);
+    }
+
+    /** The --ez keep_recordings extra turns the "Keep recordings" setting on or off. */
+    private void applyKeepRecordings(Intent i) {
+        if (i == null || !i.hasExtra("keep_recordings")) return;
+        boolean on = i.getBooleanExtra("keep_recordings", false);
+        Asr.setKeepRecordings(this, on);
+        Log.i("QwenASR", "keep_recordings=" + on);
+        if (keepCheck != null) keepCheck.setChecked(on);
     }
 
     /**
@@ -233,6 +245,15 @@ public class MainActivity extends Activity implements Streamer.Listener {
         ctl.addView(fp);
         ctl.addView(help("A language model fixes punctuation, sentence breaks and the spelling of your terms. "
                 + "It does not hear the audio. \"Show original\" undoes it."));
+
+        // --- training data ---
+        ctl.addView(header("Training data"));
+        keepCheck = check("Keep recordings (audio + text, for training data)", Asr.keepRecordings(this), on -> {
+            Asr.setKeepRecordings(this, on);
+        });
+        ctl.addView(keepCheck);
+        ctl.addView(help("Every voice-keyboard session saves its audio and text to the app's files, for later review."));
+
         Button close = small("Close settings");
         close.setOnClickListener(v -> settingsBtn.performClick());
         ctl.addView(close);

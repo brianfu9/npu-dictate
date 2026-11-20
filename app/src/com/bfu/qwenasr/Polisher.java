@@ -73,6 +73,7 @@ final class Polisher {
     static final class Result {
         List<String> lines = new ArrayList<>();
         int kept;
+        String raw;   // the model's full text output
     }
 
     private static final Pattern LINE = Pattern.compile("^\\[(\\d+)\\]\\s?(.*)$", Pattern.MULTILINE);
@@ -107,6 +108,7 @@ final class Polisher {
         String user = userText(segments);
         String out = backend.complete(systemPrompt, user, 200 + user.length() / 3);
         Result r = parse(segments, out);
+        r.raw = out;
         Log.i("QwenASR", String.format("polish (%s) %d lines, %d kept original, %.2f s", label, segments.size(), r.kept,
                 (System.nanoTime() - t0) / 1e9));
         return r;
