@@ -90,7 +90,7 @@ final class SessionLog {
                 o.put("kept", r.kept);
                 o.put("raw", r.raw);
             }
-            o.put("error", error);
+            o.put("error", error == null ? JSONObject.NULL : error);   // put(k, null) would drop the key
         } catch (Exception e) {
             Log.w("QwenASR", "session log polish entry failed: " + e.getMessage());
             return;
