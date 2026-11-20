@@ -1,0 +1,20 @@
+diff --git a/sherpa-onnx/csrc/CMakeLists.txt b/sherpa-onnx/csrc/CMakeLists.txt
+index 23d5692..c4bc609 100755
+--- a/sherpa-onnx/csrc/CMakeLists.txt
++++ b/sherpa-onnx/csrc/CMakeLists.txt
+@@ -503,6 +503,7 @@ if(SHERPA_ONNX_ENABLE_BINARY)
+   add_executable(sherpa-onnx sherpa-onnx.cc)
+   add_executable(sherpa-onnx-keyword-spotter sherpa-onnx-keyword-spotter.cc)
+   add_executable(sherpa-onnx-offline sherpa-onnx-offline.cc)
++  add_executable(sherpa-onnx-qwen3-encoder-server sherpa-onnx-qwen3-encoder-server.cc)
+   add_executable(sherpa-onnx-offline-audio-tagging sherpa-onnx-offline-audio-tagging.cc)
+   add_executable(sherpa-onnx-offline-denoiser sherpa-onnx-offline-denoiser.cc)
+   add_executable(sherpa-onnx-offline-diacritization sherpa-onnx-offline-diacritization.cc)
+@@ -528,6 +529,7 @@ if(SHERPA_ONNX_ENABLE_BINARY)
+ 
+   set(main_exes
+     sherpa-onnx
++    sherpa-onnx-qwen3-encoder-server
+     sherpa-onnx-keyword-spotter
+     sherpa-onnx-offline
+     sherpa-onnx-offline-audio-tagging

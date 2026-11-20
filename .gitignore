@@ -1,0 +1,9 @@
+out/
+app/out/
+prebuilt/
+personal
+personal/
+*.keystore
+*.jks
+__pycache__/
+.venv/

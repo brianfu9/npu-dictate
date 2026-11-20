@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.bfu.qwenasr" android:versionCode="8" android:versionName="0.8">
+  <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
+  <uses-permission android:name="android.permission.RECORD_AUDIO" />
+  <uses-permission android:name="android.permission.INTERNET" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <application android:label="Qwen ASR" android:extractNativeLibs="true" android:usesCleartextTraffic="true"
+      android:debuggable="true" android:largeHeap="false"
+      android:theme="@android:style/Theme.DeviceDefault">
+    <activity android:name=".MainActivity" android:exported="true" android:launchMode="singleTask"
+        android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|layoutDirection">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN" />
+        <category android:name="android.intent.category.LAUNCHER" />
+      </intent-filter>
+    </activity>
+    <service android:name=".AsrService" android:exported="false"
+        android:foregroundServiceType="microphone|dataSync" />
+    <service android:name=".VoiceIme" android:label="Qwen voice"
+        android:permission="android.permission.BIND_INPUT_METHOD" android:exported="true">
+      <intent-filter>
+        <action android:name="android.view.InputMethod" />
+      </intent-filter>
+      <meta-data android:name="android.view.im" android:resource="@xml/ime" />
+    </service>
+  </application>
+</manifest>

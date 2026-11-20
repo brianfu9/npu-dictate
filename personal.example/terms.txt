@@ -1,0 +1,1 @@
+Qwen, Qwen3-ASR, opencode, Claude Code, llama.cpp, llama-swap, ROCm, Vulkan, GGUF, LoRA, NPU, LiteRT, MediaTek, Dimensity, NNAPI, sherpa-onnx, Tailscale, Docker, Postgres, Home Assistant
