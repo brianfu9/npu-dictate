@@ -29,6 +29,7 @@ public final class Asr {
     private static volatile boolean ready;
     private static final ExecutorService worker = Executors.newSingleThreadExecutor();
     private static Polisher polisher;
+    private static Commands commands = Commands.empty();   // personal/commands.txt rules (no-op when empty)
     private static String polishModel = "";
     private static List<Integer> words = new ArrayList<>();
     private static long loadMs;
@@ -43,6 +44,12 @@ public final class Asr {
 
     /** The process-wide text polisher (null until the models are loaded). */
     public static Polisher polisher() { return polisher; }
+
+    /** The personal/commands.txt rules applied to a transcript; s unchanged when there are no rules. */
+    public static String applyCommands(String s) {
+        if (s == null || commands.isEmpty()) return s;
+        return commands.apply(s);
+    }
 
     /** The configured polish model name ("" when unset). */
     public static String polishModel() { return polishModel; }
@@ -112,9 +119,14 @@ public final class Asr {
         }
     }
 
+    /** The {STYLE} line used when personal/style.txt is missing. */
+    private static final String DEFAULT_STYLE =
+            "  - The first line starts with a capital letter. Every real sentence starts with a capital letter and ends with \".\", \"?\" or \"!\".";
+
     /**
      * The polisher from assets: polish.conf (url= and model= lines, # comments) plus terms.txt
-     * and polish_prompt.txt. Null when the conf is missing or has no url; sets polishModel().
+     * and polish_prompt.txt ({STYLE} replaced by personal/style.txt when present). Null when the
+     * conf is missing or has no url; sets polishModel().
      */
     private static Polisher newPolisher(Context app) throws Exception {
         String url = "", model = "";
@@ -132,7 +144,18 @@ public final class Asr {
         }
         polishModel = model;
         if (url.isEmpty()) return null;
-        return new Polisher(asset(app, "polish_prompt.txt"), asset(app, "terms.txt"), url, model);
+        String style;
+        try {
+            style = asset(app, "style.txt");
+            int end = style.length();
+            while (end > 0 && (style.charAt(end - 1) == '\n' || style.charAt(end - 1) == '\r')) end--;
+            style = style.substring(0, end);
+        } catch (Exception e) {
+            style = DEFAULT_STYLE;   // no style.txt: the default line
+        }
+        String prompt = asset(app, "polish_prompt.txt");
+        if (prompt.contains("{STYLE}")) prompt = prompt.replace("{STYLE}", style);
+        return new Polisher(prompt, asset(app, "terms.txt"), url, model);
     }
 
     /** Applies the language and word-list settings to the loaded engine (no-op until it exists). */
@@ -171,6 +194,11 @@ public final class Asr {
                 vadModel(app);
                 words = loadWordList(app);
                 polisher = newPolisher(app);   // null when polish.conf is missing or has no url
+                try {
+                    commands = Commands.parse(asset(app, "commands.txt"));
+                } catch (Exception e) {
+                    commands = Commands.empty();   // no commands.txt: no rules
+                }
                 engine.forcedLanguage = englishOnly ? new ArrayList<>(Engine.ENGLISH) : new ArrayList<>();
                 engine.wordList = useWords ? words : new ArrayList<>();
                 engine.start(nativeDir);

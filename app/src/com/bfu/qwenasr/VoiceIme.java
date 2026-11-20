@@ -359,10 +359,11 @@ public class VoiceIme extends InputMethodService {
             @Override public void onFinal(String text, String info) {
                 ui.post(() -> {
                     if (sid != sessionId) return;
-                    if (!text.isEmpty()) {
-                        raw.add(text);
+                    String t = Asr.applyCommands(text);
+                    if (!t.isEmpty()) {
+                        raw.add(t);
                         polished.add(null);
-                        if (log != null) log.segment(raw.size() - 1, text);
+                        if (log != null) log.segment(raw.size() - 1, t);
                     }
                     partial = "";
                     render();
@@ -372,7 +373,7 @@ public class VoiceIme extends InputMethodService {
             @Override public void onPartial(String text, String info) {
                 ui.post(() -> {
                     if (sid != sessionId) return;
-                    partial = text;
+                    partial = Asr.applyCommands(text);
                     render();
                 });
             }

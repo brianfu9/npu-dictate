@@ -32,6 +32,9 @@ fi
 mkdir -p $OUT/assets
 cp assets/* $OUT/assets/
 cp "$PERSONAL/terms.txt" "$PERSONAL/polish.conf" $OUT/assets/
+# optional: spoken-phrase rules and the polish-prompt style line (older personal dirs lack them)
+[ -f "$PERSONAL/commands.txt" ] && cp "$PERSONAL/commands.txt" $OUT/assets/
+[ -f "$PERSONAL/style.txt" ] && cp "$PERSONAL/style.txt" $OUT/assets/
 # PYTHON: an interpreter with `tokenizers`; defaults to the repo's .venv when it exists
 if [ -z "${PYTHON:-}" ]; then
   if [ -x ../.venv/bin/python ]; then PYTHON=../.venv/bin/python; else PYTHON=python3; fi

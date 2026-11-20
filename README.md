@@ -45,6 +45,9 @@ output looks wrong.
        context.txt  one line of comma-separated terms for the recognizer
        polish.conf  url= and model= of the polish server (any OpenAI-compatible chat
                     endpoint; leave url empty to skip the clean-up)
+       commands.txt optional: spoken phrases replaced by fixed text (e.g. "slash clear"
+                    => /clear), applied on the phone to every live and final segment
+       style.txt    optional: the line inserted into the polish prompt at {STYLE}
 
    `app/build.sh` uses `personal/` when it exists, otherwise `personal.example/`; the
    directory can be overridden with the `PERSONAL` environment variable.

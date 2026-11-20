@@ -1,0 +1,6 @@
+# Spoken phrase => replacement, one rule per line. Blank lines and # comments are ignored.
+# A phrase starting with ^ matches only at the start of a segment (after optional spaces).
+# Rules apply in file order: list longer phrases first.
+slash clear => /clear
+slash compact => /compact
+^at claude => @claude

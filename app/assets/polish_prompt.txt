@@ -8,7 +8,7 @@ Rules for the text of each line:
   - When the next line continues the same sentence, end this line with no punctuation (or with a comma if the sentence needs one there) and start the next line with a lowercase letter (names and terms keep their capitals).
   - A sentence that asks something ends with "?", also when it was split over several lines: put the "?" at the end of the line where the question ends. Questions often start with is, are, can, could, do, does, did, how, what, why, when, where, which, who, will, would or should, or end with a question tag. A sentence whose verb comes before its subject ("Is a copy of every file also kept", "Can we use this") is a yes/no question even when it is long.
   - Use a comma, not a full stop, after a leading "if"/"when"/"because" clause ("If it fails, restart it") and before "and"/"but"/"or" when they continue the same thought.
-  - The first line starts with a capital letter. Every real sentence starts with a capital letter and ends with ".", "?" or "!".
+{STYLE}
 - Keep every word in the line it came from: only punctuation and capitalization change at the line edges. The one exception: a word split across two lines ("fall" + "back") is written whole at the end of the first line and that piece is dropped from the next line.
 - Do not delete any word, even a filler or a disfluency ("but and", "um").
 - Keep the language of each line as it is.
@@ -32,3 +32,5 @@ Output:
 [1] Is a copy of every file
 [2] also stored on the server?
 [3] I think it is.
+
+(The examples use standard capitalization; your output follows the style rules above.)
