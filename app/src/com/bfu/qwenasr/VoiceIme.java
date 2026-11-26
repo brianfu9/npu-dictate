@@ -10,8 +10,10 @@ import android.media.MediaRecorder;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.provider.Settings;
 import android.util.Log;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
@@ -29,15 +31,25 @@ import java.util.concurrent.Executors;
 
 /**
  * Voice-only input method: records from the microphone and shows the live transcript as composing
- * text in the focused field. Each finished segment is replaced by its qwen27b-polished version
- * while recording continues; the text is committed when recording stops or the keyboard goes away.
+ * text in the focused field. Each finished segment is replaced by its polished version (model from
+ * polish.conf) while recording continues; the text is committed when recording stops or the keyboard goes away.
  */
 public class VoiceIme extends InputMethodService {
     private static final int RATE = Streamer.RATE;
 
     // Session state is touched on the main thread only (recording is also read by the "mic" thread).
     private final Handler ui = new Handler(Looper.getMainLooper());
-    private final ExecutorService net = Executors.newSingleThreadExecutor();   // qwen27b polish calls
+    private final ExecutorService net = Executors.newSingleThreadExecutor();   // polish calls (polish.conf model)
+
+    // Backspace auto-repeat while the key is held.
+    private static final long DEL_INITIAL_DELAY_MS = 400;
+    private static final long DEL_REPEAT_INTERVAL_MS = 60;   // ~16 chars/s
+    private final Runnable delRepeat = new Runnable() {
+        @Override public void run() {
+            backspace();
+            ui.postDelayed(this, DEL_REPEAT_INTERVAL_MS);
+        }
+    };
 
     private LinearLayout root;
     private TextView status;
@@ -54,6 +66,10 @@ public class VoiceIme extends InputMethodService {
     private String lead = "";              // a leading space when the field already has text before the cursor
     private boolean polishBusy, polishAgain, waitingToCommit, wantStart;
     private SessionLog log;                // session record for training data (null when off)
+    private String lastSource = "local";   // the backend of the last final ("local" or "server")
+    private String activeBackend = "";     // where this session's segments are routed ("on-device" or the server's host[:port])
+    private boolean sessionUsedServer, sessionUsedLocal, sessionUsedFallback;   // which backends ran this session
+    private String lastSessionSummary = "";   // "last: ..." shown after a commit
     private String lastRendered = "";      // what render() last gave to setComposingText
 
     @Override
@@ -69,7 +85,7 @@ public class VoiceIme extends InputMethodService {
         status.setTextSize(12);
         status.setTextColor(0xFFBDBDBD);
         status.setSingleLine(true);
-        status.setText("Ready");
+        status.setText(Asr.engine() == null ? "Ready" : idleStatus());
         r.addView(status);
 
         LinearLayout row = new LinearLayout(this);
@@ -82,7 +98,19 @@ public class VoiceIme extends InputMethodService {
         micBtn.setAllCaps(false);
         micBtn.setOnClickListener(v -> toggleMic());
         Button del = smallBtn("\u232B");
-        del.setOnClickListener(v -> backspace());
+        del.setOnTouchListener((v, e) -> {
+            int a = e.getActionMasked();
+            if (a == MotionEvent.ACTION_DOWN) {
+                v.setPressed(true);
+                backspace();
+                ui.removeCallbacks(delRepeat);
+                ui.postDelayed(delRepeat, DEL_INITIAL_DELAY_MS);
+            } else if (a == MotionEvent.ACTION_UP || a == MotionEvent.ACTION_CANCEL) {
+                v.setPressed(false);
+                ui.removeCallbacks(delRepeat);
+            }
+            return true;
+        });
         Button send = smallBtn("Send \u21B5");
         send.setOnClickListener(v -> sendEnter());
         int h = (int) (56 * dp);   // one height for every button
@@ -111,6 +139,21 @@ public class VoiceIme extends InputMethodService {
 
     private boolean hasComposing() { return !raw.isEmpty() || !partial.isEmpty(); }
 
+    /** The ASR endpoint's status-line name (name= from asr.conf, else host[:port]). */
+    private String serverName() { return Asr.asrName().isEmpty() ? "server" : Asr.asrName(); }
+
+    /** The idle status line: where a new recording would route, plus the last session's routes. */
+    private String idleStatus() {
+        if (!lastSessionSummary.isEmpty()) return "Ready \u00B7 " + lastSessionSummary;
+        boolean toServer = Asr.serverAsr() != null && Asr.serverAsrPrimary(this) && !Asr.serverAsr().isInCooldown();
+        return toServer ? "Ready \u00B7 " + serverName() : "Ready \u00B7 on-device";
+    }
+
+    /** The status-line label for a segment: where it was routed. */
+    private String formatBackend(String source) {
+        return "server".equals(source) ? serverName() : "on-device";
+    }
+
     // --- buttons ---
 
     private void toggleMic() {
@@ -123,7 +166,8 @@ public class VoiceIme extends InputMethodService {
         if (dictationActive()) commitNow("switch");
         // switchToPreviousInputMethod() only hid the keyboard on the OPPO phone (2026-11-20), so switch by
         // id: Gboard if enabled, else the first other enabled IME with a typing ("keyboard") subtype
-        // (skips voice-only IMEs such as Google's voice input); fall back to the picker.
+        // (skips voice-only IMEs such as Google's voice input). When the in-place switch fails, persist the
+        // target as the default IME instead of popping the picker.
         InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
         String target = null;
         for (android.view.inputmethod.InputMethodInfo info : imm.getEnabledInputMethodList()) {
@@ -137,6 +181,12 @@ public class VoiceIme extends InputMethodService {
                 return;
             } catch (RuntimeException e) {
                 Log.w("QwenASR", "switch to " + target + " failed: " + e);
+            }
+            try {
+                Settings.Secure.putString(getContentResolver(), Settings.Secure.DEFAULT_INPUT_METHOD, target);
+                return;
+            } catch (Exception e) {
+                Log.w("QwenASR", "persisting default IME " + target + " failed: " + e);
             }
         }
         imm.showInputMethodPicker();
@@ -205,7 +255,8 @@ public class VoiceIme extends InputMethodService {
         final Streamer streamer;
         try {
             streamer = new Streamer(Asr.engine(), Asr.vadModel(this), getCacheDir(), true, listenerFor(sid))
-                    .setFullPass(false, 30f);   // qwen27b polishes instead of the full pass
+                    .setFullPass(false, 30f)   // the polisher replaces the full pass
+                    .useServerAsr(Asr.serverAsr(), Asr.serverAsrPrimary(this));
         } catch (Exception e) {
             setStatus("Cannot start: " + e.getMessage());
             rec.release();
@@ -221,6 +272,10 @@ public class VoiceIme extends InputMethodService {
         }
         st = streamer;
         raw.clear(); polished.clear(); partial = "";
+        sessionUsedServer = sessionUsedLocal = sessionUsedFallback = false;
+        lastSessionSummary = "";
+        boolean toServer = Asr.serverAsr() != null && Asr.serverAsrPrimary(this) && !Asr.serverAsr().isInCooldown();
+        activeBackend = toServer ? serverName() : "on-device";
         InputConnection ic = getCurrentInputConnection();
         CharSequence before = ic == null ? null : ic.getTextBeforeCursor(1, 0);
         lead = (before != null && before.length() > 0 && !Character.isWhitespace(before.charAt(0))) ? " " : "";
@@ -247,13 +302,14 @@ public class VoiceIme extends InputMethodService {
     private void stopRecording() {
         recording = false;   // the mic thread then calls st.finish()
         micBtn.setText("\uD83C\uDFA4 Start");
-        setStatus("Finishing...");
+        setStatus("Finishing" + (!activeBackend.isEmpty() ? " \u00B7 " + activeBackend : "") + "...");
     }
 
     private void tickTimer() {
         if (!recording) return;
         long s = (SystemClock.elapsedRealtime() - recStart) / 1000;
-        setStatus(String.format(Locale.US, "Listening %d:%02d%s", s / 60, s % 60, polishBusy ? " \u00B7 polishing" : ""));
+        setStatus(String.format(Locale.US, "Listening %d:%02d%s%s", s / 60, s % 60,
+                !activeBackend.isEmpty() ? " \u00B7 " + activeBackend : "", polishBusy ? " \u00B7 polishing" : ""));
         ui.postDelayed(this::tickTimer, 250);
     }
 
@@ -278,7 +334,7 @@ public class VoiceIme extends InputMethodService {
         if (ic != null) ic.setComposingText(text, 1);
     }
 
-    /** Sends the not-yet-polished segments to qwen27b; replaces them only if nothing changed meanwhile. */
+    /** Sends the not-yet-polished segments to the polish model (polish.conf); replaces them only if nothing changed meanwhile. */
     private void schedulePolish() {
         if (Asr.polisher() == null) return;
         if (!hasUnpolished()) return;
@@ -286,13 +342,23 @@ public class VoiceIme extends InputMethodService {
         polishBusy = true;
         final int sid = sessionId;
         final List<String> snapshot = new ArrayList<>(raw);
+        final InputConnection ic = getCurrentInputConnection();
+        final CharSequence before = ic == null ? null : ic.getTextBeforeCursor(500, 0);
+        // render() just set the composing span to lastRendered with the cursor at its end, so
+        // getTextBeforeCursor includes it — strip it: the context is what was in the field
+        // BEFORE this session's text (for capitalization / sentence-boundary decisions).
+        String ctx = before == null ? "" : before.toString();
+        if (!lastRendered.isEmpty() && ctx.endsWith(lastRendered)) {
+            ctx = ctx.substring(0, ctx.length() - lastRendered.length());
+        }
+        final String context = ctx;
         final SessionLog sl = log;   // the record belongs to the session that sent this request
         final long started = SystemClock.elapsedRealtime();
         net.execute(() -> {
             Polisher.Result r = null;
             String err = null;
             try {
-                r = Asr.polisher().polish(snapshot);
+                r = Asr.polisher().polish(snapshot, context);
             } catch (IOException e) {
                 Log.w("QwenASR", "polish failed: " + e.getMessage());
                 err = e.getMessage();
@@ -300,7 +366,7 @@ public class VoiceIme extends InputMethodService {
             final Polisher.Result res = r;
             final String error = err;
             ui.post(() -> {
-                if (sl != null) sl.polish(snapshot, res, error, started, SystemClock.elapsedRealtime() - started);
+                if (sl != null) sl.polish(snapshot, context, res, error, started, SystemClock.elapsedRealtime() - started);
                 if (sid == sessionId) {
                     if (res != null) {
                         if (raw.size() >= snapshot.size() && raw.subList(0, snapshot.size()).equals(snapshot)) {
@@ -308,7 +374,7 @@ public class VoiceIme extends InputMethodService {
                             render();
                         }
                     } else {
-                        setStatus("qwen27b unavailable, raw text kept");
+                        setStatus((Asr.polishModel().isEmpty() ? "Polisher" : Asr.polishModel()) + " unavailable, raw text kept");
                         // Keep the raw text for these lines so the session does not retry forever.
                         for (int i = 0; i < snapshot.size() && i < polished.size(); i++)
                             if (polished.get(i) == null) polished.set(i, raw.get(i));
@@ -349,13 +415,29 @@ public class VoiceIme extends InputMethodService {
         waitingToCommit = false;
         wantStart = false;
         sessionId++;
-        setStatus("Ready");
+        if (Asr.serverAsr() != null && (sessionUsedServer || sessionUsedLocal)) {
+            lastSessionSummary = "last: " + (sessionUsedServer && sessionUsedLocal ? serverName() + " + on-device"
+                    : sessionUsedServer ? serverName()
+                    : "on-device");
+        }
+        setStatus(idleStatus());
     }
 
     // --- Streamer.Listener: callbacks arrive on the streaming thread, are posted to the main looper,
     // and a session's listener ignores every callback of an older session. ---
     private Streamer.Listener listenerFor(final int sid) {
         return new Streamer.Listener() {
+            @Override public void onFinalSource(String source) {
+                ui.post(() -> { if (sid == sessionId) lastSource = source; });
+            }
+            @Override public void onBackend(String source, boolean fallback) {
+                ui.post(() -> {
+                    if (sid != sessionId || Asr.serverAsr() == null) return;   // no server configured: nothing to show
+                    activeBackend = formatBackend(source);
+                    if ("server".equals(source)) sessionUsedServer = true; else sessionUsedLocal = true;
+                    if (fallback) sessionUsedFallback = true;
+                });
+            }
             @Override public void onFinal(String text, String info) {
                 ui.post(() -> {
                     if (sid != sessionId) return;
@@ -363,7 +445,7 @@ public class VoiceIme extends InputMethodService {
                     if (!t.isEmpty()) {
                         raw.add(t);
                         polished.add(null);
-                        if (log != null) log.segment(raw.size() - 1, t);
+                        if (log != null) log.segment(raw.size() - 1, t, lastSource);
                     }
                     partial = "";
                     render();
@@ -390,7 +472,7 @@ public class VoiceIme extends InputMethodService {
                     root.setKeepScreenOn(false);
                     if (polishBusy || (hasUnpolished() && Asr.polisher() != null)) {
                         waitingToCommit = true;
-                        setStatus("Polishing...");
+                        setStatus("Polishing" + (!activeBackend.isEmpty() ? " \u00B7 " + activeBackend : "") + "...");
                         ui.postDelayed(() -> { if (sid == sessionId) commitNow("stop"); }, 8000);
                     } else {
                         commitNow("stop");
@@ -410,13 +492,20 @@ public class VoiceIme extends InputMethodService {
     @Override
     public void onStartInputView(EditorInfo info, boolean restarting) {
         super.onStartInputView(info, restarting);
-        if (Asr.engine() != null || recording) return;
+        if (Asr.engine() != null) {
+            if (!dictationActive()) {
+                if (!restarting) lastSessionSummary = "";   // a new field: the old session's summary is stale
+                setStatus(idleStatus());
+            }
+            return;
+        }
+        if (recording) return;
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return;
         setStatus("Loading the speech model...");
         Asr.load(this, true, true, new Asr.Callback() {
             @Override public void onReady(Engine e) {
                 Log.i("QwenASR", "preload done load_ms=" + Asr.loadMs());
-                if (!recording && !wantStart) setStatus("Ready");
+                if (!recording && !wantStart) setStatus(idleStatus());
             }
             @Override public void onError(String message) {
                 if (!recording) setStatus(message);
@@ -434,12 +523,14 @@ public class VoiceIme extends InputMethodService {
     @Override
     public void onFinishInputView(boolean finishingInput) {
         super.onFinishInputView(finishingInput);
+        ui.removeCallbacks(delRepeat);
         if (dictationActive()) commitNow("hidden");
     }
 
     @Override
     public void onWindowHidden() {
         super.onWindowHidden();
+        ui.removeCallbacks(delRepeat);
         if (dictationActive()) commitNow("hidden");
     }
 }

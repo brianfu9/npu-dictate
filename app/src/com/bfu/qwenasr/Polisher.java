@@ -27,13 +27,19 @@ final class Polisher {
     private final String systemPrompt;
     private final String url;
     private final String model;
+    private final int priority;
     private final List<String> terms = new ArrayList<>();
     private final List<Pattern> termPatterns = new ArrayList<>();
 
     /** promptTemplate contains {TERMS}; termList is the comma-separated word list. */
     Polisher(String promptTemplate, String termList, String url, String model) {
+        this(promptTemplate, termList, url, model, 0);
+    }
+
+    Polisher(String promptTemplate, String termList, String url, String model, int priority) {
         this.url = url;
         this.model = model;
+        this.priority = priority;
         for (String t : termList.split(",")) {
             t = t.trim();
             if (t.isEmpty()) continue;
@@ -89,8 +95,12 @@ final class Polisher {
         String complete(String system, String user, int maxTokens) throws IOException;
     }
 
-    static String userText(List<String> segments) {
+    static String userText(List<String> segments, String context) {
         StringBuilder user = new StringBuilder();
+        if (context != null && !context.isEmpty()) {
+            user.append("Text already in the field before the cursor (context only; do not output it):\n\"")
+                    .append(context.replace('\n', ' ')).append("\"\n\n");
+        }
         for (int i = 0; i < segments.size(); i++) {
             if (i > 0) user.append('\n');
             user.append('[').append(i + 1).append("] ").append(segments.get(i).replace('\n', ' '));
@@ -99,17 +109,17 @@ final class Polisher {
     }
 
     Result polish(List<String> segments) throws IOException {
-        return polish(segments, this::chatComplete, model);
+        return polish(segments, "");
     }
 
-    /** Same numbered-line protocol and per-line guards for any backend. */
-    Result polish(List<String> segments, Backend backend, String label) throws IOException {
+    /** Same as polish(segments), but tells the model what text already precedes the cursor in the field. */
+    Result polish(List<String> segments, String context) throws IOException {
         long t0 = System.nanoTime();
-        String user = userText(segments);
-        String out = backend.complete(systemPrompt, user, 200 + user.length() / 3);
+        String user = userText(segments, context);
+        String out = chatComplete(systemPrompt, user, 200 + user.length() / 3);
         Result r = parse(segments, out);
         r.raw = out;
-        Log.i("QwenASR", String.format("polish (%s) %d lines, %d kept original, %.2f s", label, segments.size(), r.kept,
+        Log.i("QwenASR", String.format("polish (%s) %d lines, %d kept original, %.2f s", model, segments.size(), r.kept,
                 (System.nanoTime() - t0) / 1e9));
         return r;
     }
@@ -121,6 +131,7 @@ final class Polisher {
             body.put("model", model);
             body.put("temperature", 0);
             body.put("max_tokens", maxTokens);
+            if (priority != 0) body.put("priority", priority);
             body.put("chat_template_kwargs", new JSONObject().put("enable_thinking", false));
             JSONArray msgs = new JSONArray();
             msgs.put(new JSONObject().put("role", "system").put("content", system));
