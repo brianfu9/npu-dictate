@@ -43,6 +43,8 @@ public class MainActivity extends Activity implements Streamer.Listener {
     private static boolean fullPass = false;
     private static boolean polishOn = true;
     private static boolean englishOnly = true;
+    // On by default: the server (asr.conf) is primary; the on-device NPU is fallback.
+    private static boolean serverAsrOn = true;
     // Last polished session: its start offset in history and both versions (for the Original button).
     private static int lastOffset = -1;
     private static String lastRaw, lastPolished;
@@ -78,7 +80,12 @@ public class MainActivity extends Activity implements Streamer.Listener {
         else setStatus("Ready.");
         Asr.load(this, englishOnly, useWords, new Asr.Callback() {
             @Override public void onReady(Engine e) {
-                setStatus(String.format(Locale.US, "Ready. Speech model loaded in %.1f s. Tap Record.", Asr.loadMs() / 1000.0));
+                String msg = String.format(Locale.US, "Ready. Speech model loaded in %.1f s. Tap Record.", Asr.loadMs() / 1000.0);
+                if (Asr.serverAsr() != null)
+                    msg += Asr.serverAsr().isInCooldown() ? " ASR: NPU fallback (server offline)." : " ASR: " + Asr.asrModel();
+                setStatus(msg);
+                refreshSettingsSummary();   // buildUi ran before the load finished; update the summary now
+                refreshModels();
                 recordBtn.setEnabled(true);
             }
             @Override public void onError(String message) {
@@ -151,7 +158,8 @@ public class MainActivity extends Activity implements Streamer.Listener {
     /** Starts a new session: cancels the previous one (and its full pass), marks where its text begins. */
     private Streamer newSession(boolean live) throws Exception {
         if (current != null) current.cancel();
-        Streamer st = new Streamer(Asr.engine(), Asr.vadModel(this), getCacheDir(), live, this);
+        Streamer st = new Streamer(Asr.engine(), Asr.vadModel(this), getCacheDir(), live, this)
+                .useServerAsr(Asr.serverAsr(), Asr.serverAsrPrimary(this));
         current = st;
         final Object lock = new Object();
         synchronized (lock) {
@@ -169,6 +177,7 @@ public class MainActivity extends Activity implements Streamer.Listener {
     }
 
     private void buildUi() {
+        serverAsrOn = Asr.serverAsrPrimary(this);
         float dp = getResources().getDisplayMetrics().density;
         int pad = (int) (16 * dp);
         LinearLayout root = new LinearLayout(this);
@@ -199,7 +208,7 @@ public class MainActivity extends Activity implements Streamer.Listener {
                 LinearLayout.LayoutParams.MATCH_PARENT, (int) (80 * dp));
         lp.topMargin = pad / 2;
         ctl.addView(recordBtn, lp);
-        ctl.addView(help("Speech to text runs on this phone (no network needed). Recordings are saved in the app."));
+        ctl.addView(help("Speech to text uses the configured ASR server by default, with this phone's NPU as automatic fallback. Recordings are saved in the app."));
 
         settingsBtn = small("");
         settingsBtn.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
@@ -238,6 +247,15 @@ public class MainActivity extends Activity implements Streamer.Listener {
         });
         ctl.addView(en);
         ctl.addView(help("Always write English. Off: detect the spoken language."));
+        CheckBox sa = check("Server ASR", serverAsrOn, on -> {
+            serverAsrOn = on;
+            Asr.setServerAsrPrimary(this, on);
+            refreshSettingsSummary();
+            refreshModels();
+        });
+        ctl.addView(sa);
+        ctl.addView(help("Use the ASR server (asr.conf) first, with this phone's NPU as automatic fallback (default: on). "
+                + "Uncheck to start on the NPU."));
 
         // --- after you stop ---
         ctl.addView(header("After you stop: clean-up"));
@@ -342,9 +360,13 @@ public class MainActivity extends Activity implements Streamer.Listener {
         if (settingsBtn == null) return;
         String m = Asr.polishModel();
         String clean = !polishOn ? "off" : (m.isEmpty() ? "the polish server" : m + " on the polish server");
+        String asr = !serverAsrOn ? "off"
+                : Asr.engine() == null ? "on (loading...)"
+                : Asr.serverAsr() == null ? "on (no server in asr.conf)"
+                : (Asr.asrModel().isEmpty() ? "on" : Asr.asrModel());
         settingsBtn.setText((settingsOpen ? "\u25BE Settings  " : "\u25B8 Settings  ")
-                + String.format("Live text: %s \u00B7 Word list: %s \u00B7 %s \u00B7 Clean-up: %s",
-                        liveText ? "on" : "off", useWords ? "on" : "off", englishOnly ? "English only" : "any language", clean));
+                + String.format("Live text: %s \u00B7 Word list: %s \u00B7 %s \u00B7 Server ASR: %s \u00B7 Clean-up: %s",
+                        liveText ? "on" : "off", useWords ? "on" : "off", englishOnly ? "English only" : "any language", asr, clean));
     }
 
     private void refreshOriginalButton() {
@@ -371,7 +393,19 @@ public class MainActivity extends Activity implements Streamer.Listener {
         if (models == null) return;
         Engine e = Asr.engine();
         StringBuilder sb = new StringBuilder();
-        if (e == null) {
+        if (Asr.serverAsr() != null) {
+            // Server primary: the configured backend, its fallback state, and the local NPU status.
+            sb.append("Speech: ").append(Asr.asrModel().isEmpty() ? "the ASR server" : Asr.asrModel())
+              .append(" on the ASR server (asr.conf)")
+              .append(Asr.serverAsr().isInCooldown() ? ", offline -> NPU" : "")
+              .append("; fallback: this phone's NPU");
+            if (e != null) {
+                sb.append("\nLocal NPU: audio encoder on the CPU ")
+                  .append(e.encoderLoadedNow() ? "(loaded)" : "(not loaded)")
+                  .append(", text decoder on the NPU ")
+                  .append(e.decoderLoadedNow() ? "(loaded)" : "(unloaded; loads again when you record)");
+            }
+        } else if (e == null) {
             sb.append("Speech model (Qwen3-ASR 1.7B): loading...");
         } else {
             sb.append("Speech: Qwen3-ASR 1.7B. Audio encoder on the CPU ")
@@ -379,7 +413,10 @@ public class MainActivity extends Activity implements Streamer.Listener {
               .append(", text decoder on the NPU ")
               .append(e.decoderLoadedNow() ? "(loaded)" : "(unloaded; loads again when you record)");
         }
-        sb.append("\nan OpenAI-compatible chat endpoint from polish.conf; used for text clean-up");
+        String pm = Asr.polishModel();
+        if (!pm.isEmpty()) {
+            sb.append("\nPolish: ").append(pm).append(" (polish.conf) — cleans up the dictated text");
+        }
         models.setText(sb.toString());
     }
 
@@ -586,8 +623,11 @@ public class MainActivity extends Activity implements Streamer.Listener {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         recordBtn.setText("Stop");
         Engine e = Asr.engine();
-        if (e != null && !e.decoderLoadedNow())
+        if (serverAsrOn && Asr.serverAsr() != null) {
+            lastInfo = Asr.serverAsr().isInCooldown() ? "(NPU fallback: server offline)" : "(server " + Asr.asrModel() + ")";
+        } else if (e != null && !e.decoderLoadedNow()) {
             lastInfo = "(loading the speech decoder on the NPU again, first words in ~5 s)";
+        }
         final Streamer st = streamer;
         st.start();
         rec.startRecording();

@@ -26,6 +26,10 @@ import java.util.Locale;
  *
  * Partials are "latest wins": when a pass takes longer than PARTIAL_EVERY_S, updates are skipped,
  * never queued. Finals are always queued and run before any partial.
+ *
+ * When a server backend is configured as primary, each segment is pinned to the backend its first
+ * pass used (serverFor): a mid-sentence server recovery does not switch an in-progress sentence,
+ * and a segment that started on the NPU finishes on it.
  */
 final class Streamer {
     interface Listener {
@@ -38,6 +42,10 @@ final class Streamer {
         /** The full pass over the whole session starts / produced the session's new text. */
         default void onFullPassStart(int windows) { }
         default void onFullPass(String text, String info) { }
+        /** The backend that produced the final ("local" or "server"); called just before onFinal. */
+        default void onFinalSource(String source) { }
+        /** Active backend that produced a partial or final ("server" or "local"); fallback=true when primary failed/skipped. */
+        default void onBackend(String source, boolean fallback) { }
     }
 
     static final int RATE = 16000;
@@ -56,6 +64,8 @@ final class Streamer {
     private final File workDir;
     private final Listener listener;
     private final boolean live;
+    private ServerAsr serverAsr;          // null = the on-device NPU only
+    private boolean serverPrimary;        // true = the server first, the NPU as fallback
     private static int segCounter;
     private final float maxSegS;
     private boolean fullPass = true;
@@ -80,12 +90,18 @@ final class Streamer {
     private int lastPartialEnd;
     private List<Integer> partialIds = new ArrayList<>();
 
+    // Backend pinning per segment (only touched on the loop thread): once a segment's first pass
+    // picks a backend, its later passes and its final stay on it.
+    private int stickySeg = -1;
+    private boolean stickyServer;
+
     Streamer(Engine engine, File vadModel, File workDir, boolean live, Listener l) {
         this.engine = engine;
         this.workDir = workDir;
         this.listener = l;
         this.live = live;
         // prompt = ~15 fixed + pads + partial prefix (<= ~80); the word list is dropped when it does not fit
+        // maxSegS stays NPU-prefill-bounded even in server mode, so a mid-segment NPU fallback can never exceed engine.maxPrompt().
         this.maxSegS = Math.min(MAX_SEG_S, (engine.maxPrompt() - 15 - 80) / PADS_PER_S - 0.5f);
         SileroVadModelConfig silero = SileroVadModelConfig.builder()
                 .setModel(vadModel.getAbsolutePath())
@@ -103,6 +119,13 @@ final class Streamer {
     Streamer setFullPass(boolean on, float windowS) {
         this.fullPass = on;
         this.windowS = windowS;
+        return this;
+    }
+
+    /** The optional server ASR backend (asr.conf); primary when on. Neither set: the local NPU only. */
+    Streamer useServerAsr(ServerAsr s, boolean primary) {
+        this.serverAsr = s;
+        this.serverPrimary = primary;
         return this;
     }
 
@@ -229,6 +252,18 @@ final class Streamer {
         return this;
     }
 
+    /**
+     * The backend for this segment's passes: pinned when the segment's first pass runs, decided
+     * from the live server state otherwise. A mid-sentence server recovery (cooldown expiry or
+     * toggle) only affects segments that have not started yet. Loop thread only.
+     */
+    private boolean serverFor(int seg) {
+        if (stickySeg == seg) return stickyServer;
+        stickySeg = seg;
+        stickyServer = serverPrimary && serverAsr != null && !serverAsr.isInCooldown();
+        return stickyServer;
+    }
+
     private void run() {
         while (true) {
             int[] fin = null;
@@ -262,34 +297,96 @@ final class Streamer {
                     // keep the last 20 segment recordings for debugging (cache/segs/)
                     new File(workDir, "segs").mkdirs();
                     writeWav(fin[0], fin[1], String.format(Locale.US, "segs/seg_%02d.wav", segCounter++ % 20));
-                    Engine.Result r = engine.transcribe(writeWav(fin[0], fin[1], "final.wav"), null,
-                            maxNewFor(fin[1] - fin[0]));
+                    Engine.Result r;
+                    boolean server = false, fallback = false;
+                    if (serverPrimary && serverAsr != null) {
+                        if (serverFor(fin[2])) {   // pinned at this segment's first pass
+                            try {
+                                r = serverTranscribe(fin[0], fin[1]);
+                                server = true;
+                            } catch (IOException e) {
+                                Log.w("QwenASR", "server ASR failed, using the local model: " + e.getMessage());
+                                r = engine.transcribe(writeWav(fin[0], fin[1], "final.wav"), null, maxNewFor(fin[1] - fin[0]));
+                                fallback = true;
+                            }
+                        } else {
+                            if (serverAsr.isInCooldown()) Log.i("QwenASR", "server ASR in cooldown, using the local model");
+                            else Log.i("QwenASR", "segment pinned to the local model, staying on it");
+                            r = engine.transcribe(writeWav(fin[0], fin[1], "final.wav"), null, maxNewFor(fin[1] - fin[0]));
+                            fallback = true;
+                        }
+                    } else {
+                        try {
+                            r = engine.transcribe(writeWav(fin[0], fin[1], "final.wav"), null, maxNewFor(fin[1] - fin[0]));
+                        } catch (IOException e) {
+                            if (serverAsr == null) throw e;   // no server: the existing error path
+                            Log.w("QwenASR", "local ASR failed, using the server: " + e.getMessage());
+                            r = serverTranscribe(fin[0], fin[1]);   // last resort: bypasses the cooldown
+                            server = true;
+                            fallback = true;
+                        }
+                    }
                     if (partialSeg == fin[2]) { partialIds = new ArrayList<>(); }
-                    String info = String.format(Locale.US, "final %.1f s audio: %.2f s (enc %.2f, prefill %.2f, %d tok%s)",
-                            r.audioSec, r.totalMs / 1000, r.encoderMs / 1000, r.prefillMs / 1000, r.tokens, r.retried ? ", retried" : "");
+                    if (cancelled) continue;   // a new session started while this ran
+                    String src = server ? "server" : "local";
+                    String info = server
+                            ? String.format(Locale.US, "final %.1f s audio: %.2f s (server %s%s)", r.audioSec, r.totalMs / 1000, serverAsr.model(), fallback ? ", local failed" : "")
+                            : String.format(Locale.US, "final %s%.1f s audio: %.2f s (enc %.2f, prefill %.2f, %d tok%s)",
+                                    fallback ? "NPU fallback; " : "", r.audioSec, r.totalMs / 1000, r.encoderMs / 1000, r.prefillMs / 1000, r.tokens, r.retried ? ", retried" : "");
                     Log.i("QwenASR", info + " text=" + r.text);
                     done.add(new int[]{fin[0], fin[1]});
                     doneText.add(r.text);
+                    listener.onBackend(src, fallback);
+                    listener.onFinalSource(src);
                     listener.onFinal(r.text, info);
                     // The partial of the next (open) segment, if any, is redrawn by its next pass.
                 } else {
                     if (partialSeg != pSeg) { partialSeg = pSeg; partialCount = 0; partialIds = new ArrayList<>(); }
+                    lastPartialEnd = pEnd;   // before either backend: a fast failure cannot spin the loop
+                    boolean useServer = serverFor(pSeg);   // pinned at this segment's first pass
+                    boolean fallback = serverPrimary && serverAsr != null && !useServer;
+                    if (useServer) {
+                        // Server partials: re-upload the whole segment on the same cadence; no prefix/rollback.
+                        try {
+                            long t0 = System.nanoTime();
+                            String text = serverAsr.transcribe(wavBytes(pStart, pEnd), ServerAsr.PARTIAL_READ_TIMEOUT_MS);
+                            partialCount++;
+                            synchronized (this) {
+                                if (cancelled || pSeg != segId || segStart < 0) continue;   // segment already closed: drop
+                            }
+                            String info = String.format(Locale.US, "live %.1f s audio: %.2f s (server %s)",
+                                    (pEnd - pStart) / (float) RATE, (System.nanoTime() - t0) / 1e9, serverAsr.model());
+                            Log.i("QwenASR", info + " text=" + text);
+                            listener.onBackend("server", false);
+                            listener.onPartial(text, info);
+                            continue;
+                        } catch (IOException e) {
+                            // The server just failed: fall through to the local NPU for this partial.
+                            Log.w("QwenASR", "server partial failed: " + e.getMessage());
+                            fallback = true;
+                            synchronized (this) {
+                                if (cancelled || pSeg != segId || segStart < 0) continue;
+                                pEnd = n;            // refresh to latest audio (guaranteed < maxSegS while segment is open)
+                                lastPartialEnd = pEnd;
+                            }
+                        }
+                    }
                     List<Integer> prefix = null;
                     if (partialCount >= UNFIXED_CHUNKS && !partialIds.isEmpty()) {
                         prefix = new ArrayList<>(partialIds.subList(0, Math.max(0, partialIds.size() - ROLLBACK)));
                     }
                     int maxNew = prefix == null ? maxNewFor(pEnd - pStart) : PARTIAL_MAX_NEW;
                     Engine.Result r = engine.transcribe(writeWav(pStart, pEnd, "partial.wav"), prefix, maxNew);
-                    lastPartialEnd = pEnd;
                     partialCount++;
                     synchronized (this) {
-                        if (pSeg != segId || segStart < 0) continue;   // segment already closed: drop
+                        if (cancelled || pSeg != segId || segStart < 0) continue;   // segment already closed: drop
                     }
                     partialIds = r.rawIds;
-                    String info = String.format(Locale.US, "live %.1f s audio: %.2f s (enc %.2f, prefill %.2f, %d new tok%s)",
-                            r.audioSec, r.totalMs / 1000, r.encoderMs / 1000, r.prefillMs / 1000, r.tokens,
+                    String info = String.format(Locale.US, "live %s%.1f s audio: %.2f s (enc %.2f, prefill %.2f, %d new tok%s)",
+                            fallback ? "NPU fallback; " : "", r.audioSec, r.totalMs / 1000, r.encoderMs / 1000, r.prefillMs / 1000, r.tokens,
                             prefix == null ? "" : ", prefix " + prefix.size());
                     Log.i("QwenASR", info + " text=" + r.text);
+                    listener.onBackend("local", fallback);
                     listener.onPartial(r.text, info);
                 }
             } catch (Exception e) {
@@ -392,6 +489,14 @@ final class Streamer {
     }
 
     private File writeWavTo(int from, int to, File f) throws IOException {
+        try (FileOutputStream o = new FileOutputStream(f)) {
+            o.write(wavBytes(from, to));
+        }
+        return f;
+    }
+
+    /** The segment's audio as an in-memory 16 kHz mono WAV (for the server backend). */
+    private byte[] wavBytes(int from, int to) {
         short[] s;
         synchronized (this) {
             s = new short[to - from];
@@ -399,7 +504,17 @@ final class Streamer {
         }
         byte[] pcm = new byte[s.length * 2];
         for (int i = 0; i < s.length; i++) { pcm[2 * i] = (byte) s[i]; pcm[2 * i + 1] = (byte) (s[i] >> 8); }
-        Wav.write(f, pcm, RATE);
-        return f;
+        return Wav.toBytes(pcm, RATE);
+    }
+
+    /** The final segment on the server backend, timed like a local pass. */
+    private Engine.Result serverTranscribe(int from, int to) throws IOException {
+        long t0 = System.nanoTime();
+        String text = serverAsr.transcribe(wavBytes(from, to));
+        Engine.Result r = new Engine.Result();
+        r.text = text;
+        r.audioSec = (to - from) / (float) RATE;
+        r.totalMs = (System.nanoTime() - t0) / 1e6;
+        return r;
     }
 }

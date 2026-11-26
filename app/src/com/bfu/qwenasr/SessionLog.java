@@ -57,12 +57,16 @@ final class SessionLog {
     File jsonFile() { return new File(dir, id + ".json"); }
 
     /** A recognized segment (main thread); index is its position in the session's raw list. */
-    synchronized void segment(int index, String text) {
+    synchronized void segment(int index, String text) { segment(index, text, "local"); }
+
+    /** Same, with the backend that produced the text ("local" or "server"). */
+    synchronized void segment(int index, String text, String backend) {
         if (saved) return;
         try {
             segments.put(new JSONObject()
                     .put("i", index)
                     .put("text", text)
+                    .put("backend", backend)
                     .put("t_ms", SystemClock.elapsedRealtime() - t0));
         } catch (Exception e) {
             Log.w("QwenASR", "session log segment failed: " + e.getMessage());
@@ -70,7 +74,7 @@ final class SessionLog {
     }
 
     /** A polish request and response (main thread); startMs is an elapsedRealtime value. */
-    synchronized void polish(List<String> input, Polisher.Result r, String error, long startMs, long durationMs) {
+    synchronized void polish(List<String> input, String context, Polisher.Result r, String error, long startMs, long durationMs) {
         if (saved) return;
         JSONObject o = new JSONObject();
         try {
@@ -79,6 +83,7 @@ final class SessionLog {
             JSONArray in = new JSONArray();
             for (String s : input) in.put(s);
             o.put("input", in);
+            if (context != null && !context.isEmpty()) o.put("context", context);
             if (r == null) {
                 o.put("output", JSONObject.NULL);
                 o.put("kept", JSONObject.NULL);

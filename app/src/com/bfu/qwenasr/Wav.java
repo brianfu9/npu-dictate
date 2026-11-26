@@ -10,17 +10,30 @@ import java.nio.file.Files;
 
 /** 16-bit mono PCM WAV read/write. */
 final class Wav {
-    static void write(File f, byte[] pcm, int rate) throws IOException {
+    /** The 44-byte RIFF header for a PCM payload of pcmLen bytes. */
+    private static byte[] header(int pcmLen, int rate) {
         ByteBuffer h = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN);
-        h.put(new byte[]{'R', 'I', 'F', 'F'}).putInt(36 + pcm.length)
+        h.put(new byte[]{'R', 'I', 'F', 'F'}).putInt(36 + pcmLen)
          .put(new byte[]{'W', 'A', 'V', 'E', 'f', 'm', 't', ' '}).putInt(16)
          .putShort((short) 1).putShort((short) 1).putInt(rate).putInt(rate * 2)
          .putShort((short) 2).putShort((short) 16)
-         .put(new byte[]{'d', 'a', 't', 'a'}).putInt(pcm.length);
+         .put(new byte[]{'d', 'a', 't', 'a'}).putInt(pcmLen);
+        return h.array();
+    }
+
+    static void write(File f, byte[] pcm, int rate) throws IOException {
         try (FileOutputStream o = new FileOutputStream(f)) {
-            o.write(h.array());
+            o.write(header(pcm.length, rate));
             o.write(pcm);
         }
+    }
+
+    /** The WAV (44-byte header + PCM) in memory. */
+    static byte[] toBytes(byte[] pcm, int rate) {
+        byte[] out = new byte[44 + pcm.length];
+        System.arraycopy(header(pcm.length, rate), 0, out, 0, 44);
+        System.arraycopy(pcm, 0, out, 44, pcm.length);
+        return out;
     }
 
     /** Reads the samples of a 16-bit mono WAV (finds the "data" chunk). */

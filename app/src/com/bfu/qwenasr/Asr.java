@@ -29,8 +29,10 @@ public final class Asr {
     private static volatile boolean ready;
     private static final ExecutorService worker = Executors.newSingleThreadExecutor();
     private static Polisher polisher;
+    private static ServerAsr serverAsr;
     private static Commands commands = Commands.empty();   // personal/commands.txt rules (no-op when empty)
     private static String polishModel = "";
+    private static String asrModel = "";
     private static List<Integer> words = new ArrayList<>();
     private static long loadMs;
     private static boolean loading;
@@ -51,8 +53,32 @@ public final class Asr {
         return commands.apply(s);
     }
 
+    /** The process-wide server ASR backend (null when asr.conf is missing or has no url). */
+    public static ServerAsr serverAsr() { return serverAsr; }
+
     /** The configured polish model name ("" when unset). */
     public static String polishModel() { return polishModel; }
+
+    /** The configured server ASR model name ("" when unset). */
+    public static String asrModel() { return asrModel; }
+
+    /** The status-line name for the ASR endpoint (name= from asr.conf, else host[:port]; "" when no server). */
+    public static String asrName() {
+        ServerAsr s = serverAsr;
+        return s == null ? "" : s.label();
+    }
+
+    /** Whether the server ASR backend is primary (on by default when asr.conf has a url; NPU is fallback). */
+    public static boolean serverAsrPrimary(Context c) {
+        return c.getApplicationContext().getSharedPreferences("settings", Context.MODE_PRIVATE)
+                .getBoolean("server_asr", true);
+    }
+
+    public static void setServerAsrPrimary(Context c, boolean on) {
+        c.getApplicationContext().getSharedPreferences("settings", Context.MODE_PRIVATE)
+                .edit().putBoolean("server_asr", on).apply();
+        if (serverAsr != null) serverAsr.clearCooldown();   // the toggle re-probes the server at once
+    }
 
     /** The word list token ids, once loaded. */
     public static List<Integer> words() { return words; }
@@ -130,6 +156,7 @@ public final class Asr {
      */
     private static Polisher newPolisher(Context app) throws Exception {
         String url = "", model = "";
+        int priority = 0;
         try {
             for (String line : asset(app, "polish.conf").split("\n")) {
                 line = line.trim();
@@ -138,6 +165,9 @@ public final class Asr {
                 String k = line.substring(0, i).trim(), v = line.substring(i + 1).trim();
                 if (k.equals("url")) url = v;
                 else if (k.equals("model")) model = v;
+                else if (k.equals("priority")) {
+                    try { priority = Integer.parseInt(v); } catch (NumberFormatException ignored) {}
+                }
             }
         } catch (Exception e) {
             return null;   // no polish.conf: the app runs without clean-up
@@ -155,7 +185,31 @@ public final class Asr {
         }
         String prompt = asset(app, "polish_prompt.txt");
         if (prompt.contains("{STYLE}")) prompt = prompt.replace("{STYLE}", style);
-        return new Polisher(prompt, asset(app, "terms.txt"), url, model);
+        return new Polisher(prompt, asset(app, "terms.txt"), url, model, priority);
+    }
+
+    /**
+     * The server ASR backend from assets: asr.conf (url= and model= lines, # comments). Null when
+     * the conf is missing or has no url; sets asrModel().
+     */
+    private static ServerAsr newServerAsr(Context app) throws Exception {
+        String url = "", model = "", name = "";
+        try {
+            for (String line : asset(app, "asr.conf").split("\n")) {
+                line = line.trim();
+                if (line.isEmpty() || line.startsWith("#") || !line.contains("=")) continue;
+                int i = line.indexOf('=');
+                String k = line.substring(0, i).trim(), v = line.substring(i + 1).trim();
+                if (k.equals("url")) url = v;
+                else if (k.equals("model")) model = v;
+                else if (k.equals("name")) name = v;
+            }
+        } catch (Exception e) {
+            return null;   // no asr.conf: the app runs on-device only
+        }
+        asrModel = model;
+        if (url.isEmpty()) return null;
+        return new ServerAsr(url, model, name);
     }
 
     /** Applies the language and word-list settings to the loaded engine (no-op until it exists). */
@@ -194,6 +248,7 @@ public final class Asr {
                 vadModel(app);
                 words = loadWordList(app);
                 polisher = newPolisher(app);   // null when polish.conf is missing or has no url
+                serverAsr = newServerAsr(app);   // null when asr.conf is missing or has no url
                 try {
                     commands = Commands.parse(asset(app, "commands.txt"));
                 } catch (Exception e) {
